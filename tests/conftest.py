@@ -61,6 +61,9 @@ class ScriptedHooks(NullHooks):
         on_before_reclaim=None,
         on_reclaim_committed=None,
         on_after_reclaim=None,
+        on_export_begin=None,
+        on_export_pin_acquired=None,
+        on_export_pin_released=None,
     ) -> None:
         self._cbs = {
             "mark_begin": on_mark_begin,
@@ -70,6 +73,9 @@ class ScriptedHooks(NullHooks):
             "before_reclaim": on_before_reclaim,
             "reclaim_committed": on_reclaim_committed,
             "after_reclaim": on_after_reclaim,
+            "export_begin": on_export_begin,
+            "export_pin_acquired": on_export_pin_acquired,
+            "export_pin_released": on_export_pin_released,
         }
         self._lock = threading.Lock()
         self.events: list[tuple[str, str]] = []
@@ -79,7 +85,10 @@ class ScriptedHooks(NullHooks):
             self.events.append((name, object_id))
         cb = self._cbs[name]
         if cb is not None:
-            cb(run_id, object_id)
+            if name.startswith("export_") and name != "export_pin_acquired":
+                cb(run_id)
+            else:
+                cb(run_id, object_id)
 
     def mark_begin(self, run_id: str) -> None:
         self._fire("mark_begin", run_id)
@@ -113,6 +122,19 @@ class ScriptedHooks(NullHooks):
 
     def after_reclaim(self, run_id: str, object_id: str) -> None:
         self._fire("after_reclaim", run_id, object_id)
+
+    def export_begin(self, snapshot_id: str) -> None:
+        self._fire("export_begin", snapshot_id)
+
+    def export_pin_acquired(self, snapshot_id: str, object_ids: list[str]) -> None:
+        with self._lock:
+            self.events.append(("export_pin_acquired", ",".join(object_ids)))
+        cb = self._cbs["export_pin_acquired"]
+        if cb is not None:
+            cb(snapshot_id, object_ids)
+
+    def export_pin_released(self, snapshot_id: str) -> None:
+        self._fire("export_pin_released", snapshot_id)
 
 
 @pytest.fixture

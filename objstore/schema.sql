@@ -4,6 +4,9 @@
 -- 快照 (snapshots) 是不可变根集合；租约 (leases) 是带到期时间的临时根。
 -- gc_runs / gc_candidates 记录两阶段回收，candidates 刻意不使用外键，
 -- 以便对象行被删除后仍保留审计记录。
+-- export_pins 是快照打包导出期间的内部临时根：与租约同寿命语义
+-- （expires_at 时刻不再保活，下一次 gc_mark 清理），导出正常结束时
+-- 立即删除；进程中断后也绝不可能变成永久保活引用。
 
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
@@ -13,7 +16,7 @@ CREATE TABLE IF NOT EXISTS schema_meta (
     value TEXT NOT NULL
 );
 
-INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('version', '1');
+INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('version', '2');
 
 CREATE TABLE IF NOT EXISTS objects (
     id          TEXT PRIMARY KEY CHECK (length(id) = 64),
@@ -64,3 +67,18 @@ CREATE TABLE IF NOT EXISTS gc_candidates (
 
 -- put 复活对象时按 object_id 改判历史 reclaimed 候选。
 CREATE INDEX IF NOT EXISTS idx_gc_candidates_object ON gc_candidates(object_id);
+
+CREATE TABLE IF NOT EXISTS export_pins (
+    id          TEXT PRIMARY KEY,
+    snapshot_id TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    expires_at  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS export_pin_objects (
+    pin_id    TEXT NOT NULL REFERENCES export_pins(id) ON DELETE CASCADE,
+    object_id TEXT NOT NULL REFERENCES objects(id) ON DELETE RESTRICT,
+    PRIMARY KEY (pin_id, object_id)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_export_pins_expires_at ON export_pins(expires_at);

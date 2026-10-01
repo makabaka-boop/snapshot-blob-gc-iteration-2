@@ -50,5 +50,16 @@ class DuplicateGCRunError(RepositoryError):
     """回收运行 id 冲突（正常的 hex 摘要 id 下不会发生）。"""
 
 
+class PackageCapacityExceededError(RepositoryError):
+    """导出快照的成员总字节/成员数超过调用方给定的容量上限。
+
+    抛出前不会生成任何包文件，也不会保留导出保活引用。
+    """
+
+
+class PackageVerificationError(RepositoryError):
+    """导出包独立校验失败：结构损坏、成员摘要或整包摘要不符。"""
+
+
 class InternalConsistencyError(RepositoryError):
     """数据库与对象目录之间的不变量被破坏。"""

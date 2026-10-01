@@ -1,4 +1,9 @@
-"""数据库与对象目录之间的一致性检查（测试在每一步后调用）。"""
+"""数据库与对象目录之间的一致性检查（测试在每一步后调用）。
+
+除既有对象/快照/租约/回收审计外，也核对导出保活引用（export_pin_objects）
+引用的对象仍然存在；已到期但尚未被下一次 gc_mark 清理的 pin 是合法的临时
+状态，不算违规。
+"""
 
 from __future__ import annotations
 
@@ -38,7 +43,11 @@ def check_consistency(repo: Repository) -> ConsistencyReport:
         db_ids = {r[0] for r in conn.execute("SELECT id FROM objects").fetchall()}
 
         # 外键约束本身由 PRAGMA foreign_keys 保证，这里再显式核对引用关系。
-        for table, col in ("snapshot_objects", "object_id"), ("lease_objects", "object_id"):
+        for table, col in (
+            ("snapshot_objects", "object_id"),
+            ("lease_objects", "object_id"),
+            ("export_pin_objects", "object_id"),
+        ):
             rows = conn.execute(
                 f"SELECT DISTINCT {col} FROM {table} WHERE {col} NOT IN"
                 " (SELECT id FROM objects)"

@@ -33,6 +33,19 @@ class GCHooks(Protocol):
     def after_reclaim(self, run_id: str, object_id: str) -> None:
         """候选文件与元数据都已删除后调用。"""
 
+    def export_begin(self, snapshot_id: str) -> None:
+        """一次快照打包导出开始（尚未确定成员、尚未插入保活引用）。"""
+
+    def export_pin_acquired(self, snapshot_id: str, object_ids: list[str]) -> None:
+        """成员清单已在单个事务内确定、导出保活引用已提交、开始读文件前调用。
+
+        在此阻塞即可把“导出已取得保活资格、GC 标记/撤销在别处进行”的
+        交错固定下来。
+        """
+
+    def export_pin_released(self, snapshot_id: str) -> None:
+        """导出保活引用已释放（成功或失败路径都会调用）。"""
+
 
 class NullHooks:
     """默认空实现。"""
@@ -56,4 +69,13 @@ class NullHooks:
         pass
 
     def after_reclaim(self, run_id: str, object_id: str) -> None:
+        pass
+
+    def export_begin(self, snapshot_id: str) -> None:
+        pass
+
+    def export_pin_acquired(self, snapshot_id: str, object_ids: list[str]) -> None:
+        pass
+
+    def export_pin_released(self, snapshot_id: str) -> None:
         pass

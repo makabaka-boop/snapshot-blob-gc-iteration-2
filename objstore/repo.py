@@ -25,6 +25,12 @@
 的窗口内）被重新写入是合法的——``put`` 会在插入对象行的同一事务里把该
 对象历史遗留的 reclaimed 候选改判为 ``rescued``，使旧回收运行放弃删除
 新化身的文件；旧运行的幂等重试因此看到确定的结果，而不是一致性错误。
+
+**快照打包导出**：``export_snapshot`` 在单个 IMMEDIATE 事务内确定同一份
+快照的成员并插入带到期时间的内部保活引用（``export_pins``，与租约同寿命
+语义），保证这些对象在全部成员字节读完前不会被 GC 删除；撤销先完成则
+确定性报告快照不存在。保活引用在导出结束（成功或失败）时立即释放，进程
+中断后按 TTL 由下一次 ``gc_mark`` 清理，绝不留下永久保活。
 """
 
 from __future__ import annotations
@@ -49,14 +55,23 @@ from .exceptions import (
     InvalidObjectIdError,
     LeaseNotFoundError,
     ObjectNotFoundError,
+    PackageCapacityExceededError,
     SnapshotNotFoundError,
     UnknownGCRunError,
 )
 from .hooks import GCHooks, NullHooks
+from .package import (
+    DEFAULT_PACKAGE_MAX_BYTES,
+    SnapshotPackage,
+    write_package,
+)
 
 _SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 _OID_RE = re.compile(r"^[0-9a-f]{64}$")
 _BUSY_TIMEOUT_SECONDS = 30.0
+# 导出保活引用的默认寿命：仅需覆盖“确定成员 → 读完所有字节”这段窗口；
+# 它只是进程中断后的兜底，正常导出一结束就立即释放。
+_DEFAULT_EXPORT_PIN_TTL_SECONDS = 3600
 
 
 def _validate_oid(oid: str) -> str:
@@ -390,6 +405,139 @@ class Repository:
         finally:
             conn.close()
 
+    # ------------------------------------------------- 快照打包导出（有界）
+
+    def export_snapshot(
+        self,
+        snapshot_id: str,
+        dest: str | os.PathLike[str],
+        *,
+        max_bytes: int | None = DEFAULT_PACKAGE_MAX_BYTES,
+        max_objects: int | None = None,
+        pin_ttl: timedelta | None = None,
+    ) -> SnapshotPackage:
+        """把一份**已发布**快照原子地打包导出为整包文件。
+
+        正确性要点（与“后台同时撤销快照并回收对象”的竞争）：
+
+        1. **先确定同一份快照的成员**：成员清单在单个 IMMEDIATE 写事务内
+           读取；快照在该事务里不存在就确定性地抛
+           :class:`SnapshotNotFoundError`——撤销若先于该事务完成，导出
+           必然报告快照不存在。
+        2. **再取得覆盖整个读取窗口的保活资格**：同一事务里为这些成员
+           插入带到期时间的内部保活引用（``export_pins``）。一旦提交，
+           两阶段 GC 的复核就必须把成员判为存活（与租约同语义），撤销
+           快照或扫描其他候选都不可能在全部读取结束前删掉这些文件；
+           若 GC 的写事务先拿到锁并完成删除，则成员读取在这里确定性地
+           看到快照/对象缺失而失败。两种交错结果互斥，包绝不会混入
+           两次快照状态。
+        3. **失败不交付半包**：容量超限在写入任何字节前抛出；成员文件
+           缺失、大小或内容摘要不符则中止打包，临时文件被清理，
+           ``dest`` 不会被创建或覆盖。
+        4. **不留永久保活**：保活引用在成功与所有失败路径上都立即释放；
+           若进程在窗口内被杀死，引用按 ``pin_ttl`` 到期，下一次
+           ``gc_mark`` 自动清理，之后对象照常回收。
+        """
+
+        self.hooks.export_begin(snapshot_id)
+        ttl = pin_ttl if pin_ttl is not None else timedelta(
+            seconds=_DEFAULT_EXPORT_PIN_TTL_SECONDS
+        )
+        pin_id = "export-" + uuid.uuid4().hex
+        now = self._now()
+        expires_at = now + int(ttl.total_seconds() * 1_000_000)
+
+        # 阶段一：单事务确定成员 + 插入保活引用。
+        with self._tx() as conn:
+            snap = conn.execute(
+                "SELECT 1 FROM snapshots WHERE id = ?", (snapshot_id,)
+            ).fetchone()
+            if snap is None:
+                # 撤销先完成（或从未发布）：确定结果，不写任何内容。
+                raise SnapshotNotFoundError(f"快照不存在: {snapshot_id}")
+            members = [
+                r[0]
+                for r in conn.execute(
+                    "SELECT object_id FROM snapshot_objects WHERE snapshot_id = ?"
+                    " ORDER BY object_id",
+                    (snapshot_id,),
+                ).fetchall()
+            ]
+            if max_objects is not None and len(members) > max_objects:
+                raise PackageCapacityExceededError(
+                    f"导出成员数 {len(members)} 超过上限 {max_objects}"
+                )
+            if members:
+                placeholders = ",".join("?" * len(members))
+                size_rows = conn.execute(
+                    f"SELECT id, size FROM objects WHERE id IN ({placeholders})",
+                    members,
+                ).fetchall()
+                sizes = {r[0]: r[1] for r in size_rows}
+            else:
+                sizes = {}
+            missing = [oid for oid in members if oid not in sizes]
+            if missing:
+                # 与 GC 并发且删除事务先提交：对象行已不可见。
+                raise ObjectNotFoundError(object_ids=missing)
+            declared_total = sum(sizes.values())
+            if max_bytes is not None and declared_total > max_bytes:
+                # 容量上限在写任何包字节之前判定，绝不产出半包。
+                raise PackageCapacityExceededError(
+                    f"快照成员总字节 {declared_total} 超过导出上限 {max_bytes}"
+                )
+            for oid in members:
+                if not self._path_for(oid).exists():
+                    raise InternalConsistencyError(
+                        f"数据库引用了缺失的对象文件: {oid}"
+                    )
+            conn.execute(
+                "INSERT INTO export_pins(id, snapshot_id, created_at, expires_at)"
+                " VALUES (?, ?, ?, ?)",
+                (pin_id, snapshot_id, now, expires_at),
+            )
+            conn.executemany(
+                "INSERT INTO export_pin_objects(pin_id, object_id) VALUES (?, ?)",
+                [(pin_id, oid) for oid in members],
+            )
+
+        # 保活资格已提交：从此刻直到 _release_export_pin，任何 GC 运行的
+        # 复核都必须把这些成员判活。钩子在此阻塞即可固定交错顺序。
+        self.hooks.export_pin_acquired(snapshot_id, members)
+        try:
+            entries = [(oid, sizes[oid], self._path_for(oid)) for oid in members]
+            package = write_package(
+                dest,
+                snapshot_id,
+                entries,
+                max_bytes=max_bytes,
+            )
+        finally:
+            # 成功与所有失败路径都释放；即便释放本身失败，到期时间也
+            # 保证它不会成为永久保活引用。
+            with contextlib.suppress(Exception):
+                self._release_export_pin(pin_id)
+            self.hooks.export_pin_released(snapshot_id)
+        return package
+
+    def _release_export_pin(self, pin_id: str) -> None:
+        with self._tx() as conn:
+            conn.execute("DELETE FROM export_pins WHERE id = ?", (pin_id,))
+
+    def list_export_pins(self) -> list[str]:
+        """当前存在的导出保活引用 id（诊断/测试用；正常导出结束后必为空）。"""
+
+        conn = self._connect()
+        try:
+            return [
+                r[0]
+                for r in conn.execute(
+                    "SELECT id FROM export_pins ORDER BY id"
+                ).fetchall()
+            ]
+        finally:
+            conn.close()
+
     # ------------------------------------------------------------- 租约操作
 
     def grant_lease(
@@ -498,6 +646,7 @@ class Repository:
             if dup is not None:
                 raise DuplicateGCRunError(f"回收运行 id 已存在: {run_id}")
             self._prune_expired_leases(conn, now)
+            self._prune_expired_export_pins(conn, now)
             all_objects = {
                 r[0] for r in conn.execute("SELECT id FROM objects").fetchall()
             }
@@ -705,6 +854,12 @@ class Repository:
         conn.execute("DELETE FROM leases WHERE expires_at <= ?", (now,))
 
     @staticmethod
+    def _prune_expired_export_pins(conn: sqlite3.Connection, now: int) -> None:
+        # 导出保活引用与租约同寿命语义：到期随下一次标记清理，
+        # 级联删除 export_pin_objects。崩溃中断的导出因此不可能永久保活。
+        conn.execute("DELETE FROM export_pins WHERE expires_at <= ?", (now,))
+
+    @staticmethod
     def _is_live(conn: sqlite3.Connection, object_id: str, now: int) -> bool:
         row = conn.execute(
             """
@@ -713,9 +868,13 @@ class Repository:
             SELECT 1 FROM lease_objects lo
             JOIN leases l ON l.id = lo.lease_id
             WHERE lo.object_id = ? AND l.expires_at > ?
+            UNION ALL
+            SELECT 1 FROM export_pin_objects po
+            JOIN export_pins p ON p.id = po.pin_id
+            WHERE po.object_id = ? AND p.expires_at > ?
             LIMIT 1
             """,
-            (object_id, object_id, now),
+            (object_id, object_id, now, object_id, now),
         ).fetchone()
         return row is not None
 
@@ -735,6 +894,18 @@ class Repository:
                 FROM lease_objects lo
                 JOIN leases l ON l.id = lo.lease_id
                 WHERE l.expires_at > ?
+                """,
+                (now,),
+            ).fetchall()
+        )
+        live.update(
+            r[0]
+            for r in conn.execute(
+                """
+                SELECT DISTINCT po.object_id
+                FROM export_pin_objects po
+                JOIN export_pins p ON p.id = po.pin_id
+                WHERE p.expires_at > ?
                 """,
                 (now,),
             ).fetchall()
